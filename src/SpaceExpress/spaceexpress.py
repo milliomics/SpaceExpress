@@ -1,4 +1,5 @@
 import pickle, random
+from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
@@ -16,6 +17,28 @@ def get_index (data):
     mask = torch.triu(torch.ones((n_cells, n_cells)), diagonal=1)        
     index = torch.nonzero(mask, as_tuple=False)
     return index
+
+def _sample_pairs(n_cells: int, num_pairs: int, device=None):
+    """Sample approximately num_pairs pairs (i < j) without building full O(n^2) indices."""
+    total_pairs = n_cells * (n_cells - 1) // 2
+    k = min(num_pairs, total_pairs)
+
+    # Heuristic oversampling then filter i<j
+    oversample = max(k * 2, k + 1024)
+    pairs_i = torch.randint(0, n_cells, (oversample,), device=device)
+    pairs_j = torch.randint(0, n_cells, (oversample,), device=device)
+    mask = pairs_i < pairs_j
+    i = pairs_i[mask]
+    j = pairs_j[mask]
+
+    if i.numel() < k:
+        need = k - i.numel()
+        extra = _sample_pairs(n_cells, need, device=device)
+        i = torch.cat([i, extra[:, 0]])
+        j = torch.cat([j, extra[:, 1]])
+
+    idx = torch.stack([i[:k], j[:k]], dim=1)
+    return idx
 
 def loaded_paths(file_path):
     loaded_paths = {}
@@ -52,16 +75,22 @@ class KKLoss:
         self.shortest_path = torch.tensor(shortest_path, dtype=torch.float32).to(device)
 
     def __call__(self, p, idx):
-        d = self.shortest_path
-        mask = d != 0
-        d_inv = torch.where(mask, 1 / d**2, torch.zeros_like(d))
-        p = p.unsqueeze(1) - p.unsqueeze(0)
-        p = torch.sum(torch.abs(p),dim=-1)
-        diff = p - d
-        out = d_inv * mask * diff.pow(2)
-        out = out[idx[:, 0], idx[:, 1]]
-        out = torch.sum(out)   
-        return out
+        # Compute loss only on sampled pairs to avoid O(n^2) memory
+        i = idx[:, 0].long()
+        j = idx[:, 1].long()
+
+        # Pairwise L1 distances in embedding space on sampled pairs
+        pij = torch.sum(torch.abs(p[i] - p[j]), dim=-1)
+
+        # Geodesic distances for sampled pairs
+        dij = self.shortest_path[i, j]
+
+        # Weights 1 / d^2 for d>0, else 0
+        w = torch.where(dij > 0, 1.0 / (dij * dij), torch.zeros_like(dij))
+
+        # Weighted squared error
+        diff = pij - dij
+        return torch.sum(w * diff * diff)
 
 def get_avg_neighbor(pos, count, k):
     A = kneighbors_graph(pos, k, mode='connectivity', include_self=False)
@@ -126,7 +155,6 @@ def train_SpaceExpress(adata, shortest_file_path, device = None, epochs = 10000,
     data = torch.tensor(data, dtype=torch.float).to(device) 
     model = SpaceExpress(data.shape[1], hid_dim, emb_dim).to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    index = get_index(data)
     kkloss = KKLoss(device, shortest_path)
 
     best_train_loss = float('inf')
@@ -138,7 +166,8 @@ def train_SpaceExpress(adata, shortest_file_path, device = None, epochs = 10000,
         for epoch in tqdm(range(epochs)):
             total_loss = 0
             
-            idx = index[torch.randperm(index.size(0))[:batch_size**2]]
+            num_pairs = min(batch_size * batch_size, (data.shape[0] * (data.shape[0] - 1)) // 2)
+            idx = _sample_pairs(data.shape[0], num_pairs, device=data.device)
             optimizer.zero_grad()
             embeddings = model(data.to(device))
             loss = kkloss(embeddings, idx)        
@@ -243,11 +272,11 @@ def train_SpaceExpress_multi(adata_list_input, shortest_file_path_list, device =
     model = SpaceExpress(num_gene, hid_dim, emb_dim).to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
       
-    index_list = [get_index(data) for data in data_list]
     kkloss_list = [KKLoss(device, shortest_path) for shortest_path in shortest_path_list]
 
     best_train_loss = float('inf')
     patience_counter = 0
+    loss_history = []  # Track loss per epoch
     
     # Training loop
     print('Start training...')
@@ -259,17 +288,18 @@ def train_SpaceExpress_multi(adata_list_input, shortest_file_path_list, device =
             loss = 0
             for i in range(num_data):
                 data = data_list[i]
-                index = index_list[i]
                 kkloss = kkloss_list[i]
                 
                 optimizer.zero_grad()
                 embeddings = model(data.to(device))
-                idx = index[torch.randperm(index.size(0))[:batch_size**2]]
+                num_pairs = min(batch_size * batch_size, (data.shape[0] * (data.shape[0] - 1)) // 2)
+                idx = _sample_pairs(data.shape[0], num_pairs, device=data.device)
                 loss += kkloss(embeddings, idx)      
                 
             loss.backward()
             optimizer.step()
-            total_loss += loss.item()        
+            total_loss += loss.item()
+            loss_history.append(total_loss)  # Save loss for this epoch
 
             pbar.set_description(f"Epoch {epoch+1}/{epochs}")
             pbar.set_postfix(loss=f"{total_loss:.4f}")
@@ -293,8 +323,9 @@ def train_SpaceExpress_multi(adata_list_input, shortest_file_path_list, device =
         emb = best_model(data)
         emb = emb.cpu().detach().numpy()
         out.append(emb)
-        
-    if save_model == True:
-        return out, best_model
     
-    return out
+    # Return embeddings and loss history
+    if save_model == True:
+        return out, best_model, loss_history
+    
+    return out, loss_history

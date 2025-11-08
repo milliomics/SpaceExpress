@@ -385,7 +385,16 @@ class calculate_test_statistic_multi_rep:
         emb = np.concatenate([self.adata_list[i].obsm['SpaceExpress'][:, d] for i in range(len(self.adata_list))])
         g_id = np.concatenate([np.array([self.group_id[i]]*self.adata_list[i].X.shape[0]) for i in range(len(self.adata_list))])
         rep = np.concatenate([np.array([i]*self.adata_list[i].X.shape[0]) for i in range(len(self.adata_list))])
-        exp = np.concatenate([self.adata_list[i].X[:, g] for i in range(len(self.adata_list))])
+        # Extract gene expression: handle both sparse and dense matrices, ensure 1D arrays
+        exp_list = []
+        for i in range(len(self.adata_list)):
+            exp_i = self.adata_list[i].X[:, g]
+            if hasattr(exp_i, 'toarray'):
+                exp_i = exp_i.toarray().flatten()
+            else:
+                exp_i = np.asarray(exp_i).flatten()
+            exp_list.append(exp_i)
+        exp = np.concatenate(exp_list)
         
         if self.cell_type != None:
             ct = np.concatenate([self.adata_list[i].obs[self.cell_type].values.tolist() for i in range(len(self.adata_list))])
@@ -427,7 +436,19 @@ class calculate_test_statistic:
         # Extract the embedding and expression data
         emb = np.concatenate([self.adata_1.obsm['SpaceExpress'][:, d], self.adata_2.obsm['SpaceExpress'][:, d]])
         data_id = np.concatenate([np.array([0]*self.adata_1.X.shape[0]), np.array([1]*self.adata_2.X.shape[0])])
-        exp = np.concatenate([self.adata_1.X[:, g], self.adata_2.X[:, g]])
+        # Extract gene expression: handle both sparse and dense matrices, ensure 1D arrays
+        exp1 = self.adata_1.X[:, g]
+        exp2 = self.adata_2.X[:, g]
+        # Convert to dense array if sparse, then flatten to 1D
+        if hasattr(exp1, 'toarray'):
+            exp1 = exp1.toarray().flatten()
+        else:
+            exp1 = np.asarray(exp1).flatten()
+        if hasattr(exp2, 'toarray'):
+            exp2 = exp2.toarray().flatten()
+        else:
+            exp2 = np.asarray(exp2).flatten()
+        exp = np.concatenate([exp1, exp2])
         df = pd.DataFrame({'emb': emb, 'exp': exp, 'data_id': data_id})
         # Calculate the test statistic
         try:    
@@ -513,7 +534,7 @@ def empirical_null(df, quant_val = 0.75):
     return df_fdr
 
 
-def SpaceExpress_DSE(emb, adata_list, cell_type = None, k = 300, n_jobs=-1, multi = False, 
+def SpaceExpress_DSE(emb, adata_list, cell_type = None, k = 300, n_jobs=1, multi = False, 
                      group_id = None, quant_val = 0.75):
     """
     Perform the SpaceExpress differential spatial expression analysis
@@ -547,7 +568,22 @@ def SpaceExpress_DSE(emb, adata_list, cell_type = None, k = 300, n_jobs=-1, mult
     jobs = [(d, g) for d in range(num_dim) for g in range(num_gene)]
 
     # Run jobs in parallel with progress monitoring
-    results = Parallel(n_jobs=n_jobs)(delayed(cal_statistic)(d, g) for d, g in tqdm(jobs, desc="Processing"))
+    # Add timeout and error handling for R process crashes
+    # Use verbose=0 to reduce output, backend='threading' can be more stable with R
+    # timeout=None means no timeout (R computations can be slow)
+    try:
+        results = Parallel(
+            n_jobs=n_jobs,
+            verbose=0,
+            timeout=None,  # No timeout - R computations can be slow
+            backend='loky',  # More stable than threading for R processes
+            prefer='processes'  # Use processes (more isolated, better for R)
+        )(delayed(cal_statistic)(d, g) for d, g in tqdm(jobs, desc="Processing"))
+    except Exception as e:
+        print(f"\nERROR during parallel processing: {e}")
+        print("This may be due to R process crashes or memory issues.")
+        print("Try reducing --n-jobs to 1 for more stable (but slower) processing.")
+        raise
 
     # Convert results back to the test_statistics array
     test_statistics = np.zeros((num_dim, num_gene))
@@ -576,8 +612,11 @@ def SpaceExpress_DSE(emb, adata_list, cell_type = None, k = 300, n_jobs=-1, mult
     df_test_statistics = pd.DataFrame(data=test_statistics, index=range(num_dim), columns=list(adata_list[0].var_names))
     df_fdr = empirical_null(df_test_statistics, quant_val)
 
-    adata_list[0].varm['DSE-fdr'] = df_fdr.T
-    adata_list[1].varm['DSE-fdr'] = df_fdr.T
+    # Convert column names to strings for h5ad compatibility (dimensions: 0,1,2,3 -> '0','1','2','3')
+    df_fdr_varm = df_fdr.T.copy()
+    df_fdr_varm.columns = df_fdr_varm.columns.astype(str)
+    adata_list[0].varm['DSE-fdr'] = df_fdr_varm
+    adata_list[1].varm['DSE-fdr'] = df_fdr_varm
     
     for i in range(len(adata_list)):
         adata_list[i].obsm['DSE-pred'] = predictions_list[i]
