@@ -534,7 +534,7 @@ def empirical_null(df, quant_val = 0.75):
     return df_fdr
 
 
-def SpaceExpress_DSE(emb, adata_list, cell_type = None, k = 300, n_jobs=1, multi = False, 
+def SpaceExpress_DSE(emb, adata_list, cell_type = None, k = 100, n_jobs=1, multi = False, 
                      group_id = None, quant_val = 0.75):
     """
     Perform the SpaceExpress differential spatial expression analysis
@@ -610,13 +610,12 @@ def SpaceExpress_DSE(emb, adata_list, cell_type = None, k = 300, n_jobs=1, multi
             # interactions_list[i][:, g, d] = inter[num_cell_list[i]*i:num_cell_list[i]*(i+1)]
             
     df_test_statistics = pd.DataFrame(data=test_statistics, index=range(num_dim), columns=list(adata_list[0].var_names))
+    # Compute FDR with dimensions as rows, genes as columns (original format)
     df_fdr = empirical_null(df_test_statistics, quant_val)
 
-    # Convert column names to strings for h5ad compatibility (dimensions: 0,1,2,3 -> '0','1','2','3')
-    df_fdr_varm = df_fdr.T.copy()
-    df_fdr_varm.columns = df_fdr_varm.columns.astype(str)
-    adata_list[0].varm['DSE-fdr'] = df_fdr_varm
-    adata_list[1].varm['DSE-fdr'] = df_fdr_varm
+    # For h5ad varm storage (genes x features), transpose so genes are rows
+    adata_list[0].varm['DSE-fdr'] = df_fdr.T
+    adata_list[1].varm['DSE-fdr'] = df_fdr.T
     
     for i in range(len(adata_list)):
         adata_list[i].obsm['DSE-pred'] = predictions_list[i]
@@ -628,35 +627,20 @@ def SpaceExpress_DSE(emb, adata_list, cell_type = None, k = 300, n_jobs=1, multi
 
     return df_fdr, adata_list
 
-def summary_DSE (df, threshold = 0.001):
+def summary_DSE(df, threshold = 0.001):
     """
-    Summarize the differential spatial expression results
-    
-    Inputs:
-    df (pd.DataFrame): A pandas DataFrame containing the false discovery rates
-    
-    Returns:
-    summary_df (pd.DataFrame): A pandas DataFrame containing the summary results
+    Summarize the differential spatial expression results per embedding dimension.
+    Format: dimensions as rows, genes as columns (original format)
     """
-    # Identify the positions where the condition is met
-    condition = df < threshold
-
-    # Create a dictionary to store the summary data
     summary_dict = {'Dim': [], 'DSE Count': [], 'DSE': []}
-
-    # Iterate over each row to summarize the data
+    
+    # Original format: dimensions as rows, genes as columns
+    condition = df < threshold
     for row_index, row_data in condition.iterrows():
-        selected_columns = row_data[row_data].index.tolist()
-        if selected_columns:
-            summary_dict['Dim'].append(row_index)
-            summary_dict['DSE Count'].append(len(selected_columns))
-            summary_dict['DSE'].append(selected_columns)
-        else:
-            summary_dict['Dim'].append(row_index)
-            summary_dict['DSE Count'].append(0)
-            summary_dict['DSE'].append([])
+        selected_genes = row_data[row_data].index.tolist()
+        summary_dict['Dim'].append(int(row_index) if isinstance(row_index, (str, bytes)) else row_index)
+        summary_dict['DSE Count'].append(len(selected_genes))
+        summary_dict['DSE'].append(selected_genes)
 
-    # Convert the summary dictionary to a DataFrame
-    summary_df = pd.DataFrame(summary_dict)
-    return summary_df
+    return pd.DataFrame(summary_dict)
 
